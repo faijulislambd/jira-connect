@@ -17,7 +17,8 @@ const requiredEnvironmentVariables = [
   "JIRA_BASE_URL",
   "JIRA_PROJECT_KEY",
   "JIRA_ISSUE_TYPE",
-  "JIRA_TOKEN",
+  "UPSTASH_REDIS_REST_URL",
+  "UPSTASH_REDIS_REST_TOKEN",
 ];
 
 const missingEnvironmentVariables = requiredEnvironmentVariables.filter(
@@ -278,11 +279,122 @@ function getJiraError(result) {
 
 /*
 |--------------------------------------------------------------------------
+| Upstash Jira token store
+|--------------------------------------------------------------------------
+*/
+const jiraTokenStoreKey = String(
+  process.env.JIRA_TOKEN_STORE_KEY || "jira-user-tokens",
+).trim();
+const tokenCacheTtlMs = Number(process.env.JIRA_TOKEN_CACHE_TTL_MS || 60000);
+let jiraTokenCache = { loadedAt: 0, entries: [] };
+
+function parseStoredTokenDocument(value) {
+  let current = value;
+  for (let attempt = 0; attempt < 2 && typeof current === "string"; attempt++) {
+    const text = current.trim();
+    if (!text) return { data: { tokens: [] } };
+    try {
+      current = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Upstash key "${jiraTokenStoreKey}" does not contain valid JSON.`,
+      );
+    }
+  }
+  return current;
+}
+
+function extractTokenEntries(document) {
+  const tokens =
+    document && document.data && Array.isArray(document.data.tokens)
+      ? document.data.tokens
+      : [];
+  const entries = tokens
+    .map(function (entry) {
+      return {
+        name: String(entry && entry.name ? entry.name : "").trim(),
+        token: String(entry && entry.token ? entry.token : "").trim(),
+      };
+    })
+    .filter(function (entry) {
+      return Boolean(entry.name && entry.token);
+    });
+  const seen = new Set();
+  const duplicates = new Set();
+  entries.forEach(function (entry) {
+    const name = normalizeText(entry.name);
+    if (seen.has(name)) duplicates.add(entry.name);
+    seen.add(name);
+  });
+  if (duplicates.size > 0) {
+    throw new Error(
+      `Upstash contains duplicate Jira token names: ${Array.from(duplicates).join(", ")}.`,
+    );
+  }
+  return entries;
+}
+
+async function loadJiraTokenEntries(forceRefresh = false) {
+  const now = Date.now();
+  if (
+    !forceRefresh &&
+    jiraTokenCache.entries.length > 0 &&
+    now - jiraTokenCache.loadedAt < tokenCacheTtlMs
+  ) {
+    return jiraTokenCache.entries;
+  }
+  const url = String(process.env.UPSTASH_REDIS_REST_URL).replace(/\/+$/, "");
+  const response = await fetch(
+    `${url}/get/${encodeURIComponent(jiraTokenStoreKey)}`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${process.env.UPSTASH_REDIS_REST_TOKEN}`,
+        Accept: "application/json",
+      },
+    },
+  );
+  const result = await parseResponse(response);
+  if (!response.ok)
+    throw new Error(
+      `Upstash token lookup failed with HTTP ${response.status}.`,
+    );
+  if (result.result === null || result.result === undefined) {
+    throw new Error(`Upstash key "${jiraTokenStoreKey}" was not found.`);
+  }
+  const entries = extractTokenEntries(parseStoredTokenDocument(result.result));
+  jiraTokenCache = { loadedAt: now, entries };
+  return entries;
+}
+
+async function resolveJiraTokenForAssignee(assignedTo) {
+  if (!isUnassignedValue(assignedTo)) {
+    const requested = normalizeText(assignedTo);
+    const entries = await loadJiraTokenEntries();
+    const match = entries.find(function (entry) {
+      return normalizeText(entry.name) === requested;
+    });
+    if (match)
+      return {
+        token: match.token,
+        source: "upstash-assignee-token",
+        user: match.name,
+      };
+  }
+  return {
+    token: String(process.env.JIRA_TOKEN).trim(),
+    source: "environment-default",
+    user: "",
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
 | Jira assignee lookup
 |--------------------------------------------------------------------------
 */
 
-async function resolveAssignableUser(userInput) {
+async function resolveAssignableUser(userInput, jiraToken) {
   const requestedUser = String(userInput || "").trim();
 
   if (isUnassignedValue(requestedUser)) {
@@ -300,7 +412,7 @@ async function resolveAssignableUser(userInput) {
     method: "GET",
 
     headers: {
-      Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+      Authorization: `Bearer ${jiraToken}`,
       Accept: "application/json",
     },
   });
@@ -380,7 +492,7 @@ async function resolveAssignableUser(userInput) {
 |--------------------------------------------------------------------------
 */
 
-async function findIssueByIntegrationId(integrationId) {
+async function findIssueByIntegrationId(integrationId, jiraToken) {
   const integrationLabel = createIntegrationLabel(integrationId);
 
   if (!integrationLabel) {
@@ -402,7 +514,7 @@ async function findIssueByIntegrationId(integrationId) {
     method: "GET",
 
     headers: {
-      Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+      Authorization: `Bearer ${jiraToken}`,
       Accept: "application/json",
     },
   });
@@ -439,7 +551,7 @@ async function findIssueByIntegrationId(integrationId) {
 |--------------------------------------------------------------------------
 */
 
-async function getJiraIssue(issueKey) {
+async function getJiraIssue(issueKey, jiraToken) {
   const response = await fetch(
     `${jiraBaseUrl}/rest/api/2/issue/` +
       `${encodeURIComponent(issueKey)}` +
@@ -448,7 +560,7 @@ async function getJiraIssue(issueKey) {
       method: "GET",
 
       headers: {
-        Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+        Authorization: `Bearer ${jiraToken}`,
         Accept: "application/json",
       },
     },
@@ -470,8 +582,8 @@ async function getJiraIssue(issueKey) {
   return result;
 }
 
-async function getIssueStatus(issueKey) {
-  const issue = await getJiraIssue(issueKey);
+async function getIssueStatus(issueKey, jiraToken) {
+  const issue = await getJiraIssue(issueKey, jiraToken);
 
   if (!issue) {
     throw new Error(`Jira issue ${issueKey} was not found.`);
@@ -496,7 +608,7 @@ async function getIssueStatus(issueKey) {
 |--------------------------------------------------------------------------
 */
 
-async function getIssueTransitions(issueKey) {
+async function getIssueTransitions(issueKey, jiraToken) {
   const transitionsUrl =
     `${jiraBaseUrl}/rest/api/2/issue/` +
     `${encodeURIComponent(issueKey)}` +
@@ -506,7 +618,7 @@ async function getIssueTransitions(issueKey) {
     method: "GET",
 
     headers: {
-      Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+      Authorization: `Bearer ${jiraToken}`,
       Accept: "application/json",
     },
   });
@@ -557,8 +669,8 @@ function transitionMatches(transition, possibleNames) {
   });
 }
 
-async function performTransition(issueKey, possibleNames) {
-  const transitions = await getIssueTransitions(issueKey);
+async function performTransition(issueKey, possibleNames, jiraToken) {
+  const transitions = await getIssueTransitions(issueKey, jiraToken);
 
   const availableTransitions = transitions.map(getTransitionDetails);
 
@@ -594,7 +706,7 @@ async function performTransition(issueKey, possibleNames) {
     method: "POST",
 
     headers: {
-      Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+      Authorization: `Bearer ${jiraToken}`,
       Accept: "application/json",
       "Content-Type": "application/json",
     },
@@ -667,10 +779,10 @@ async function performTransition(issueKey, possibleNames) {
 |--------------------------------------------------------------------------
 */
 
-async function applyDateBasedStatus(issueKey, endDate) {
+async function applyDateBasedStatus(issueKey, endDate, jiraToken) {
   const hasEndDate = Boolean(endDate && String(endDate).trim());
 
-  const currentIssue = await getIssueStatus(issueKey);
+  const currentIssue = await getIssueStatus(issueKey, jiraToken);
 
   const currentStatus = normalizeText(currentIssue.status);
 
@@ -725,16 +837,20 @@ async function applyDateBasedStatus(issueKey, endDate) {
    * End Date exists, move to Done.
    */
   if (hasEndDate) {
-    const doneResult = await performTransition(issueKey, [
-      "Done",
-      "Resolve",
-      "Resolve Issue",
-      "Resolved",
-      "Complete",
-      "Completed",
-      "Close",
-      "Close Issue",
-    ]);
+    const doneResult = await performTransition(
+      issueKey,
+      [
+        "Done",
+        "Resolve",
+        "Resolve Issue",
+        "Resolved",
+        "Complete",
+        "Completed",
+        "Close",
+        "Close Issue",
+      ],
+      jiraToken,
+    );
 
     return {
       requestedStatus: "Done",
@@ -753,16 +869,20 @@ async function applyDateBasedStatus(issueKey, endDate) {
    * If the ticket is already Done, the workflow may expose a
    * Reopen transition whose destination is In Progress or To Do.
    */
-  const inProgressResult = await performTransition(issueKey, [
-    "In Progress",
-    "Dev - In Progress",
-    "Start Progress",
-    "Start Work",
-    "Reopen",
-    "Re-open",
-    "Reopen Issue",
-    "Return to In Progress",
-  ]);
+  const inProgressResult = await performTransition(
+    issueKey,
+    [
+      "In Progress",
+      "Dev - In Progress",
+      "Start Progress",
+      "Start Work",
+      "Reopen",
+      "Re-open",
+      "Reopen Issue",
+      "Return to In Progress",
+    ],
+    jiraToken,
+  );
 
   return {
     requestedStatus: "In Progress",
@@ -785,6 +905,7 @@ async function applyDateBasedStatus(issueKey, endDate) {
 */
 
 async function prepareIssueData(body) {
+  const jiraCredential = await resolveJiraTokenForAssignee(body.assignedTo);
   const summary = body.summary;
   const description = body.description;
   const service = body.service;
@@ -833,7 +954,10 @@ async function prepareIssueData(body) {
 
   const calculatedStatus = cleanEndDate ? "Done" : "In Progress";
 
-  const assignee = await resolveAssignableUser(assignedTo);
+  const assignee = await resolveAssignableUser(
+    assignedTo,
+    jiraCredential.token,
+  );
 
   if (!isUnassignedValue(assignedTo) && !assignee) {
     throw new Error(
@@ -900,6 +1024,9 @@ async function prepareIssueData(body) {
     assignee,
     jiraDescription,
     labels,
+    jiraToken: jiraCredential.token,
+    jiraTokenSource: jiraCredential.source,
+    jiraTokenUser: jiraCredential.user,
   };
 }
 
@@ -991,19 +1118,53 @@ function buildUpdateFields(prepared) {
 |--------------------------------------------------------------------------
 */
 
-app.get("/api/health", function (req, res) {
-  return res.json({
-    success: true,
-    service: "TechOps Jira API",
-    projectKey: jiraProjectKey,
-    issueType: jiraIssueType,
-
-    dateBasedWorkflow: {
-      resolutionDateBlank: "In Progress",
-
-      resolutionDatePresent: "Done",
-    },
-  });
+app.get("/api/health", async function (req, res) {
+  try {
+    const tokenEntries = await loadJiraTokenEntries();
+    return res.json({
+      success: true,
+      service: "TechOps Jira API",
+      projectKey: jiraProjectKey,
+      issueType: jiraIssueType,
+      tokenStore: {
+        provider: "Upstash Redis",
+        key: jiraTokenStoreKey,
+        availableTokenNames: tokenEntries.map(function (entry) {
+          return entry.name;
+        }),
+        count: tokenEntries.length,
+        fallbackConfigured: Boolean(
+          String(process.env.JIRA_TOKEN || "").trim(),
+        ),
+      },
+      dateBasedWorkflow: {
+        resolutionDateBlank: "In Progress",
+        resolutionDatePresent: "Done",
+      },
+    });
+  } catch (error) {
+    return res.status(503).json({
+      success: false,
+      service: "TechOps Jira API",
+      projectKey: jiraProjectKey,
+      issueType: jiraIssueType,
+      tokenStore: {
+        provider: "Upstash Redis",
+        key: jiraTokenStoreKey,
+        availableTokenNames: [],
+        count: 0,
+        fallbackConfigured: Boolean(
+          String(process.env.JIRA_TOKEN || "").trim(),
+        ),
+        error:
+          error instanceof Error ? error.message : "Token store unavailable.",
+      },
+      dateBasedWorkflow: {
+        resolutionDateBlank: "In Progress",
+        resolutionDatePresent: "Done",
+      },
+    });
+  }
 });
 
 /*
@@ -1112,6 +1273,7 @@ app.post("/api/jira/issues", async function (req, res) {
      */
     const existingIssue = await findIssueByIntegrationId(
       prepared.cleanIntegrationId,
+      prepared.jiraToken,
     );
 
     if (existingIssue) {
@@ -1134,7 +1296,7 @@ app.post("/api/jira/issues", async function (req, res) {
       method: "POST",
 
       headers: {
-        Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+        Authorization: `Bearer ${prepared.jiraToken}`,
         Accept: "application/json",
         "Content-Type": "application/json",
       },
@@ -1171,6 +1333,7 @@ app.post("/api/jira/issues", async function (req, res) {
       statusResult = await applyDateBasedStatus(
         createdIssueKey,
         prepared.cleanEndDate,
+        prepared.jiraToken,
       );
     } catch (statusError) {
       console.error("Issue created, but status update failed", {
@@ -1208,6 +1371,8 @@ app.post("/api/jira/issues", async function (req, res) {
       jiraUrl: `${jiraBaseUrl}/browse/` + `${createdIssueKey}`,
 
       integrationId: prepared.cleanIntegrationId,
+      jiraTokenSource: prepared.jiraTokenSource,
+      jiraTokenUser: prepared.jiraTokenUser,
 
       assignee: prepared.assignee
         ? {
@@ -1276,16 +1441,6 @@ app.put("/api/jira/issues/:jiraKey", async function (req, res) {
       });
     }
 
-    const existingIssue = await getJiraIssue(jiraKey);
-
-    if (!existingIssue) {
-      return res.status(404).json({
-        success: false,
-
-        message: `Jira issue ${jiraKey} was not found.`,
-      });
-    }
-
     let prepared;
 
     try {
@@ -1293,11 +1448,18 @@ app.put("/api/jira/issues/:jiraKey", async function (req, res) {
     } catch (validationError) {
       return res.status(400).json({
         success: false,
-
         message:
           validationError instanceof Error
             ? validationError.message
             : "The request is invalid.",
+      });
+    }
+
+    const existingIssue = await getJiraIssue(jiraKey, prepared.jiraToken);
+    if (!existingIssue) {
+      return res.status(404).json({
+        success: false,
+        message: `Jira issue ${jiraKey} was not found.`,
       });
     }
 
@@ -1307,6 +1469,7 @@ app.put("/api/jira/issues/:jiraKey", async function (req, res) {
      */
     const issueUsingIntegrationId = await findIssueByIntegrationId(
       prepared.cleanIntegrationId,
+      prepared.jiraToken,
     );
 
     if (issueUsingIntegrationId && issueUsingIntegrationId.key !== jiraKey) {
@@ -1333,7 +1496,7 @@ app.put("/api/jira/issues/:jiraKey", async function (req, res) {
         method: "PUT",
 
         headers: {
-          Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+          Authorization: `Bearer ${prepared.jiraToken}`,
           Accept: "application/json",
           "Content-Type": "application/json",
         },
@@ -1367,7 +1530,11 @@ app.put("/api/jira/issues/:jiraKey", async function (req, res) {
     let statusResult;
 
     try {
-      statusResult = await applyDateBasedStatus(jiraKey, prepared.cleanEndDate);
+      statusResult = await applyDateBasedStatus(
+        jiraKey,
+        prepared.cleanEndDate,
+        prepared.jiraToken,
+      );
     } catch (statusError) {
       console.error("Issue updated, but status change failed", {
         jiraKey,
@@ -1404,6 +1571,8 @@ app.put("/api/jira/issues/:jiraKey", async function (req, res) {
       jiraUrl: `${jiraBaseUrl}/browse/${jiraKey}`,
 
       integrationId: prepared.cleanIntegrationId,
+      jiraTokenSource: prepared.jiraTokenSource,
+      jiraTokenUser: prepared.jiraTokenUser,
 
       assignee: prepared.assignee
         ? {
@@ -1491,6 +1660,7 @@ app.listen(port, function () {
   console.log("Resolution Date blank: In Progress");
 
   console.log("Resolution Date populated: Done");
+  console.log(`Jira token store: Upstash key ${jiraTokenStoreKey}`);
 
   console.log(
     process.env.EXPRESS_INTEGRATION_KEY
