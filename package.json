@@ -1,0 +1,25 @@
+{
+  "name": "jira-excel-connect",
+  "version": "1.0.0",
+  "description": "This is an express to connect the jira platform to any sheet as microsoft automation is premium",
+  "homepage": "https://github.com/faijulislambd/jira-connect#readme",
+  "bugs": {
+    "url": "https://github.com/faijulislambd/jira-connect/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/faijulislambd/jira-connect.git"
+  },
+  "author": "Fuad",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0"
+  }
+}
