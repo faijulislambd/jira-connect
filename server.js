@@ -9,7 +9,7 @@ const app = express();
 
 /*
 |--------------------------------------------------------------------------
-| Configuration checks
+| Environment configuration
 |--------------------------------------------------------------------------
 */
 
@@ -34,6 +34,14 @@ if (missingEnvironmentVariables.length > 0) {
   process.exit(1);
 }
 
+const jiraBaseUrl = String(process.env.JIRA_BASE_URL).replace(/\/+$/, "");
+
+const jiraProjectKey = String(process.env.JIRA_PROJECT_KEY)
+  .trim()
+  .toUpperCase();
+
+const jiraIssueType = String(process.env.JIRA_ISSUE_TYPE).trim();
+
 /*
 |--------------------------------------------------------------------------
 | Middleware
@@ -54,8 +62,8 @@ app.use(
   cors({
     origin: function (origin, callback) {
       /*
-       * PowerShell and other server-side clients may not send Origin.
-       * Office Scripts uses a Microsoft-hosted origin.
+       * PowerShell and server-side tools may not include an Origin.
+       * Office Scripts normally uses a Microsoft-hosted origin.
        */
       if (
         !origin ||
@@ -86,6 +94,45 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
+| Optional Express API authentication
+|--------------------------------------------------------------------------
+|
+| If EXPRESS_INTEGRATION_KEY is present in .env, every Jira API request
+| must include:
+|
+| X-Integration-Key: your-secret-key
+|
+| The health endpoint remains available without the key.
+|--------------------------------------------------------------------------
+*/
+
+function validateIntegrationKey(req, res, next) {
+  const requiredKey = String(process.env.EXPRESS_INTEGRATION_KEY || "").trim();
+
+  /*
+   * If no key is configured, allow access.
+   * This is useful for local testing.
+   */
+  if (!requiredKey) {
+    return next();
+  }
+
+  const suppliedKey = String(req.get("X-Integration-Key") || "").trim();
+
+  if (!suppliedKey || suppliedKey !== requiredKey) {
+    return res.status(401).json({
+      success: false,
+      message: "The Express integration key is missing or invalid.",
+    });
+  }
+
+  return next();
+}
+
+app.use("/api/jira", validateIntegrationKey);
+
+/*
+|--------------------------------------------------------------------------
 | General helper functions
 |--------------------------------------------------------------------------
 */
@@ -110,6 +157,7 @@ function normalizeDate(value) {
    */
   if (/^\d{4}-\d{2}-\d{2}$/.test(input)) {
     const parts = input.split("-");
+
     const year = Number(parts[0]);
     const month = Number(parts[1]);
     const day = Number(parts[2]);
@@ -130,16 +178,14 @@ function normalizeDate(value) {
   /*
    * Excel workbook format:
    * MM/DD/YYYY
-   *
-   * Examples:
-   * 10/06/2026
-   * 10/6/2026
    */
   const slashDateMatch = input.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
 
   if (slashDateMatch) {
     const monthNumber = Number(slashDateMatch[1]);
+
     const dayNumber = Number(slashDateMatch[2]);
+
     const yearNumber = Number(slashDateMatch[3]);
 
     const date = new Date(Date.UTC(yearNumber, monthNumber - 1, dayNumber));
@@ -153,12 +199,15 @@ function normalizeDate(value) {
     }
 
     const month = String(monthNumber).padStart(2, "0");
+
     const day = String(dayNumber).padStart(2, "0");
 
     return `${yearNumber}-${month}-${day}`;
   }
 
-  throw new Error(`Invalid date "${input}". Use MM/DD/YYYY or YYYY-MM-DD.`);
+  throw new Error(
+    `Invalid date "${input}". ` + "Use MM/DD/YYYY or YYYY-MM-DD.",
+  );
 }
 
 function createServiceLabel(service) {
@@ -169,6 +218,38 @@ function createServiceLabel(service) {
     .replace(/^-+|-+$/g, "");
 
   return normalizedService ? `service-${normalizedService}` : "";
+}
+
+function createIntegrationLabel(integrationId) {
+  const cleanId = String(integrationId || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return cleanId ? `excel-id-${cleanId}` : "";
+}
+
+function isUnassignedValue(value) {
+  const normalizedValue = normalizeText(value);
+
+  return (
+    !normalizedValue ||
+    normalizedValue === "unassigned" ||
+    normalizedValue === "automatic"
+  );
+}
+
+function validateJiraKey(value) {
+  const jiraKey = String(value || "")
+    .trim()
+    .toUpperCase();
+
+  const pattern = new RegExp(
+    `^${jiraProjectKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d+$`,
+  );
+
+  return pattern.test(jiraKey);
 }
 
 async function parseResponse(response) {
@@ -187,29 +268,33 @@ async function parseResponse(response) {
   }
 }
 
+function getJiraError(result) {
+  if (!result) {
+    return result;
+  }
+
+  return result.errors || result.errorMessages || result;
+}
+
 /*
 |--------------------------------------------------------------------------
-| Jira assignable-user lookup
+| Jira assignee lookup
 |--------------------------------------------------------------------------
 */
 
 async function resolveAssignableUser(userInput) {
   const requestedUser = String(userInput || "").trim();
 
-  if (
-    !requestedUser ||
-    normalizeText(requestedUser) === "unassigned" ||
-    normalizeText(requestedUser) === "automatic"
-  ) {
+  if (isUnassignedValue(requestedUser)) {
     return null;
   }
 
   const searchUrl =
-    `${process.env.JIRA_BASE_URL}` +
-    `/rest/api/2/user/assignable/search` +
-    `?project=${encodeURIComponent(process.env.JIRA_PROJECT_KEY)}` +
+    `${jiraBaseUrl}` +
+    "/rest/api/2/user/assignable/search" +
+    `?project=${encodeURIComponent(jiraProjectKey)}` +
     `&username=${encodeURIComponent(requestedUser)}` +
-    `&maxResults=100`;
+    "&maxResults=100";
 
   const response = await fetch(searchUrl, {
     method: "GET",
@@ -229,13 +314,14 @@ async function resolveAssignableUser(userInput) {
     });
 
     throw new Error(
-      `Jira assignee search failed with HTTP ${response.status}.`,
+      `Jira assignee search failed with ` + `HTTP ${response.status}.`,
     );
   }
 
   if (!Array.isArray(jiraResult)) {
     throw new Error(
-      "Jira returned an unexpected response while searching for the assignee.",
+      "Jira returned an unexpected response " +
+        "while searching for the assignee.",
     );
   }
 
@@ -247,7 +333,9 @@ async function resolveAssignableUser(userInput) {
     }
 
     const username = normalizeText(user.name);
+
     const displayName = normalizeText(user.displayName);
+
     const emailAddress = normalizeText(user.emailAddress);
 
     return (
@@ -263,16 +351,13 @@ async function resolveAssignableUser(userInput) {
 
   if (exactMatches.length > 1) {
     throw new Error(
-      `More than one Jira account exactly matched "${requestedUser}". ` +
-        "Enter the exact Jira username in Excel.",
+      `More than one Jira account exactly matched ` +
+        `"${requestedUser}". Use the exact Jira username.`,
     );
   }
 
-  /*
-   * Jira may return one partial match even if it was not an exact match.
-   */
   const activeUsers = jiraResult.filter(function (user) {
-    return user.active === true && user.name;
+    return user.active === true && Boolean(user.name);
   });
 
   if (activeUsers.length === 1) {
@@ -282,7 +367,7 @@ async function resolveAssignableUser(userInput) {
   if (activeUsers.length > 1) {
     throw new Error(
       `Multiple Jira users matched "${requestedUser}". ` +
-        "Enter the exact Jira username shown in the Assignee dropdown.",
+        "Use the exact Jira username shown in Jira.",
     );
   }
 
@@ -291,15 +376,131 @@ async function resolveAssignableUser(userInput) {
 
 /*
 |--------------------------------------------------------------------------
-| Jira workflow functions
+| Duplicate detection
+|--------------------------------------------------------------------------
+*/
+
+async function findIssueByIntegrationId(integrationId) {
+  const integrationLabel = createIntegrationLabel(integrationId);
+
+  if (!integrationLabel) {
+    return null;
+  }
+
+  const jql =
+    `project = ${jiraProjectKey} ` +
+    `AND labels = "${integrationLabel}" ` +
+    "ORDER BY created DESC";
+
+  const searchUrl =
+    `${jiraBaseUrl}/rest/api/2/search` +
+    `?jql=${encodeURIComponent(jql)}` +
+    "&maxResults=2" +
+    "&fields=key,summary,status";
+
+  const response = await fetch(searchUrl, {
+    method: "GET",
+
+    headers: {
+      Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+      Accept: "application/json",
+    },
+  });
+
+  const result = await parseResponse(response);
+
+  if (!response.ok) {
+    console.error("Jira duplicate search failed", {
+      status: response.status,
+      response: result,
+    });
+
+    throw new Error(
+      `Jira duplicate search failed with ` + `HTTP ${response.status}.`,
+    );
+  }
+
+  const issues = Array.isArray(result.issues) ? result.issues : [];
+
+  if (issues.length > 1) {
+    throw new Error(
+      `Multiple Jira issues use Integration ID ` +
+        `"${integrationId}". Resolve the duplicate ` +
+        "labels in Jira before continuing.",
+    );
+  }
+
+  return issues.length === 1 ? issues[0] : null;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Jira issue information
+|--------------------------------------------------------------------------
+*/
+
+async function getJiraIssue(issueKey) {
+  const response = await fetch(
+    `${jiraBaseUrl}/rest/api/2/issue/` +
+      `${encodeURIComponent(issueKey)}` +
+      "?fields=key,summary,status,resolution,labels",
+    {
+      method: "GET",
+
+      headers: {
+        Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+        Accept: "application/json",
+      },
+    },
+  );
+
+  const result = await parseResponse(response);
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `Could not read Jira issue ${issueKey}. ` +
+        `Jira returned HTTP ${response.status}.`,
+    );
+  }
+
+  return result;
+}
+
+async function getIssueStatus(issueKey) {
+  const issue = await getJiraIssue(issueKey);
+
+  if (!issue) {
+    throw new Error(`Jira issue ${issueKey} was not found.`);
+  }
+
+  return {
+    status:
+      issue.fields && issue.fields.status && issue.fields.status.name
+        ? String(issue.fields.status.name)
+        : "",
+
+    resolution:
+      issue.fields && issue.fields.resolution && issue.fields.resolution.name
+        ? String(issue.fields.resolution.name)
+        : "",
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Jira workflow transitions
 |--------------------------------------------------------------------------
 */
 
 async function getIssueTransitions(issueKey) {
   const transitionsUrl =
-    `${process.env.JIRA_BASE_URL}` +
-    `/rest/api/2/issue/${encodeURIComponent(issueKey)}` +
-    `/transitions?expand=transitions.fields`;
+    `${jiraBaseUrl}/rest/api/2/issue/` +
+    `${encodeURIComponent(issueKey)}` +
+    "/transitions?expand=transitions.fields";
 
   const response = await fetch(transitionsUrl, {
     method: "GET",
@@ -320,8 +521,9 @@ async function getIssueTransitions(issueKey) {
     });
 
     throw new Error(
-      `Could not retrieve workflow transitions for ${issueKey}. ` +
-        `Jira returned HTTP ${response.status}.`,
+      `Could not retrieve workflow transitions ` +
+        `for ${issueKey}. Jira returned ` +
+        `HTTP ${response.status}.`,
     );
   }
 
@@ -332,6 +534,7 @@ function getTransitionDetails(transition) {
   return {
     id: String(transition.id || ""),
     name: String(transition.name || ""),
+
     destination:
       transition.to && transition.to.name ? String(transition.to.name) : "",
   };
@@ -367,9 +570,11 @@ async function performTransition(issueKey, possibleNames) {
     return {
       success: false,
       changed: false,
+
       message:
-        `No available Jira transition matched: ` +
+        "No available Jira transition matched: " +
         `${possibleNames.join(", ")}.`,
+
       availableTransitions,
     };
   }
@@ -381,9 +586,9 @@ async function performTransition(issueKey, possibleNames) {
   };
 
   const transitionUrl =
-    `${process.env.JIRA_BASE_URL}` +
-    `/rest/api/2/issue/${encodeURIComponent(issueKey)}` +
-    `/transitions`;
+    `${jiraBaseUrl}/rest/api/2/issue/` +
+    `${encodeURIComponent(issueKey)}` +
+    "/transitions";
 
   const response = await fetch(transitionUrl, {
     method: "POST",
@@ -411,13 +616,20 @@ async function performTransition(issueKey, possibleNames) {
     return {
       success: false,
       changed: false,
+
       transitionId: String(matchingTransition.id),
+
       transitionName: matchingTransition.name,
+
       message:
-        `Jira transition "${matchingTransition.name}" failed ` +
+        `Jira transition ` +
+        `"${matchingTransition.name}" failed ` +
         `with HTTP ${response.status}.`,
+
       jiraStatus: response.status,
-      jiraErrors: jiraResult.errors || jiraResult.errorMessages || jiraResult,
+
+      jiraErrors: getJiraError(jiraResult),
+
       availableTransitions,
     };
   }
@@ -427,89 +639,376 @@ async function performTransition(issueKey, possibleNames) {
   return {
     success: true,
     changed: true,
+
     transitionId: transitionDetails.id,
+
     transitionName: transitionDetails.name,
+
     destinationStatus: transitionDetails.destination,
+
     message:
       `${issueKey} moved to ` +
       `"${transitionDetails.destination || transitionDetails.name}".`,
+
     availableTransitions,
   };
 }
 
 /*
 |--------------------------------------------------------------------------
-| Determine Jira status from End Date
+| Date-based Jira status
 |--------------------------------------------------------------------------
 |
-| End Date blank:
-|   Initial status is To Do.
-|   Express moves the issue to In Progress.
+| Resolution Date blank:
+|   Desired Jira status is In Progress.
 |
-| End Date present:
-|   Initial status is To Do.
-|   Express moves the issue directly to Done.
-|
+| Resolution Date populated:
+|   Desired Jira status is Done.
+|--------------------------------------------------------------------------
 */
 
 async function applyDateBasedStatus(issueKey, endDate) {
   const hasEndDate = Boolean(endDate && String(endDate).trim());
 
-  const inProgressTransitionNames = [
-    "In Progress",
-    "Dev - In Progress",
-    "Start Progress",
-    "Start Work",
-  ];
+  const currentIssue = await getIssueStatus(issueKey);
 
-  const doneTransitionNames = ["Done"];
+  const currentStatus = normalizeText(currentIssue.status);
+
+  const doneStatuses = ["done", "resolved", "closed", "completed"];
+
+  const inProgressStatuses = ["in progress", "dev in progress"];
+
+  const currentIsDone = doneStatuses.includes(currentStatus);
+
+  const currentIsInProgress = inProgressStatuses.includes(currentStatus);
 
   /*
-   * No End Date means the task is still active.
+   * End Date exists and issue is already complete.
    */
-  if (!hasEndDate) {
-    const inProgressResult = await performTransition(
-      issueKey,
-      inProgressTransitionNames,
-    );
-
+  if (hasEndDate && currentIsDone) {
     return {
-      requestedStatus: "In Progress",
-      statusChanged: inProgressResult.success,
-      actualResult: inProgressResult,
-      message: inProgressResult.success
-        ? `${issueKey} moved to In Progress because End Date is blank.`
-        : `${issueKey} was created, but the In Progress transition was not available.`,
+      requestedStatus: "Done",
+      statusChanged: true,
+      alreadyCorrect: true,
+
+      actualResult: {
+        success: true,
+        changed: false,
+        currentStatus: currentIssue.status,
+        resolution: currentIssue.resolution,
+      },
+
+      message: `${issueKey} is already in ` + `${currentIssue.status}.`,
     };
   }
 
   /*
-   * End Date exists, so the task is complete.
-   *
-   * The Jira workflow shown allows:
-   * To Do -> Done
+   * End Date is blank and issue is already In Progress.
    */
-  const doneResult = await performTransition(issueKey, doneTransitionNames);
+  if (!hasEndDate && currentIsInProgress) {
+    return {
+      requestedStatus: "In Progress",
+      statusChanged: true,
+      alreadyCorrect: true,
+
+      actualResult: {
+        success: true,
+        changed: false,
+        currentStatus: currentIssue.status,
+      },
+
+      message: `${issueKey} is already in ` + `${currentIssue.status}.`,
+    };
+  }
+
+  /*
+   * End Date exists, move to Done.
+   */
+  if (hasEndDate) {
+    const doneResult = await performTransition(issueKey, [
+      "Done",
+      "Resolve",
+      "Resolve Issue",
+      "Resolved",
+      "Complete",
+      "Completed",
+      "Close",
+      "Close Issue",
+    ]);
+
+    return {
+      requestedStatus: "Done",
+      statusChanged: doneResult.success,
+      actualResult: doneResult,
+
+      message: doneResult.success
+        ? `${issueKey} moved to Done because ` + "Resolution Date is present."
+        : `${issueKey} could not be moved to Done. ` + doneResult.message,
+    };
+  }
+
+  /*
+   * End Date is blank.
+   *
+   * If the ticket is already Done, the workflow may expose a
+   * Reopen transition whose destination is In Progress or To Do.
+   */
+  const inProgressResult = await performTransition(issueKey, [
+    "In Progress",
+    "Dev - In Progress",
+    "Start Progress",
+    "Start Work",
+    "Reopen",
+    "Re-open",
+    "Reopen Issue",
+    "Return to In Progress",
+  ]);
 
   return {
-    requestedStatus: "Done",
-    statusChanged: doneResult.success,
-    actualResult: doneResult,
-    message: doneResult.success
-      ? `${issueKey} moved to Done because End Date is present.`
-      : `${issueKey} was created, but the Done transition was not available.`,
+    requestedStatus: "In Progress",
+    statusChanged: inProgressResult.success,
+    actualResult: inProgressResult,
+
+    message: inProgressResult.success
+      ? `${issueKey} moved to In Progress ` +
+        "because Resolution Date is blank."
+      : `${issueKey} could not be moved to ` +
+        "In Progress. " +
+        inProgressResult.message,
   };
 }
 
 /*
 |--------------------------------------------------------------------------
-| Get assignable Jira users
+| Prepare issue content
 |--------------------------------------------------------------------------
-|
-| Examples:
-|
-| GET /api/jira/assignees?search=Faijul
-| GET /api/jira/assignees?search=faijul.islam
+*/
+
+async function prepareIssueData(body) {
+  const summary = body.summary;
+  const description = body.description;
+  const service = body.service;
+  const taskSource = body.taskSource;
+  const taskDate = body.taskDate;
+  const resolution = body.resolution;
+  const resolutionBy = body.resolutionBy;
+  const assignedTo = body.assignedTo;
+  const startDate = body.startDate;
+  const endDate = body.endDate;
+  const integrationId = body.integrationId;
+
+  if (!summary || typeof summary !== "string") {
+    throw new Error("Summary is required.");
+  }
+
+  const cleanSummary = summary.trim();
+
+  if (!cleanSummary) {
+    throw new Error("Summary cannot be empty.");
+  }
+
+  if (cleanSummary.length > 255) {
+    throw new Error("Summary cannot exceed 255 characters.");
+  }
+
+  const cleanIntegrationId = String(integrationId || "").trim();
+
+  if (!cleanIntegrationId) {
+    throw new Error("Integration ID is required.");
+  }
+
+  let cleanTaskDate = "";
+  let cleanStartDate = "";
+  let cleanEndDate = "";
+
+  cleanTaskDate = normalizeDate(taskDate);
+
+  cleanStartDate = normalizeDate(startDate);
+
+  cleanEndDate = normalizeDate(endDate);
+
+  if (!cleanStartDate && cleanTaskDate) {
+    cleanStartDate = cleanTaskDate;
+  }
+
+  const calculatedStatus = cleanEndDate ? "Done" : "In Progress";
+
+  const assignee = await resolveAssignableUser(assignedTo);
+
+  if (!isUnassignedValue(assignedTo) && !assignee) {
+    throw new Error(
+      `No active assignable Jira account ` +
+        `matched "${assignedTo}" in project ` +
+        `${jiraProjectKey}. Use the exact ` +
+        "Jira username.",
+    );
+  }
+
+  const jiraDescription = [
+    description ? `Task Description:\n${description}` : "",
+
+    service ? `Service: ${service}` : "",
+
+    taskSource ? `Task Source: ${taskSource}` : "",
+
+    cleanTaskDate ? `Task Date: ${cleanTaskDate}` : "",
+
+    cleanStartDate ? `Start Date: ${cleanStartDate}` : "",
+
+    cleanEndDate ? `End Date: ${cleanEndDate}` : "",
+
+    `Calculated Jira Status: ${calculatedStatus}`,
+
+    resolution ? `Resolution:\n${resolution}` : "",
+
+    resolutionBy ? `Resolution By: ${resolutionBy}` : "",
+
+    `Excel Integration ID: ${cleanIntegrationId}`,
+
+    assignee
+      ? "Requested Assignee: " +
+        `${assignee.displayName || assignee.name} ` +
+        `(${assignee.name})`
+      : "Requested Assignee: Unassigned",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  const labels = ["excel-techops"];
+
+  const integrationLabel = createIntegrationLabel(cleanIntegrationId);
+
+  if (integrationLabel) {
+    labels.push(integrationLabel);
+  }
+
+  const serviceLabel = createServiceLabel(service);
+
+  if (serviceLabel) {
+    labels.push(serviceLabel);
+  }
+
+  labels.push(cleanEndDate ? "excel-completed" : "excel-in-progress");
+
+  return {
+    cleanSummary,
+    cleanIntegrationId,
+    cleanTaskDate,
+    cleanStartDate,
+    cleanEndDate,
+    calculatedStatus,
+    assignee,
+    jiraDescription,
+    labels,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Build Jira fields
+|--------------------------------------------------------------------------
+*/
+
+function buildCreateFields(prepared) {
+  const jiraFields = {
+    project: {
+      key: jiraProjectKey,
+    },
+
+    issuetype: {
+      name: jiraIssueType,
+    },
+
+    summary: prepared.cleanSummary,
+
+    description: prepared.jiraDescription,
+
+    priority: {
+      name: process.env.JIRA_DEFAULT_PRIORITY || "Medium",
+    },
+
+    labels: prepared.labels,
+  };
+
+  if (prepared.assignee) {
+    jiraFields.assignee = {
+      name: prepared.assignee.name,
+    };
+  }
+
+  if (prepared.cleanStartDate && process.env.JIRA_START_DATE_FIELD) {
+    jiraFields[process.env.JIRA_START_DATE_FIELD] = prepared.cleanStartDate;
+  }
+
+  if (prepared.cleanEndDate && process.env.JIRA_END_DATE_FIELD) {
+    jiraFields[process.env.JIRA_END_DATE_FIELD] = prepared.cleanEndDate;
+  }
+
+  if (
+    prepared.cleanEndDate &&
+    normalizeText(process.env.USE_END_DATE_AS_DUE_DATE) === "true"
+  ) {
+    jiraFields.duedate = prepared.cleanEndDate;
+  }
+
+  return jiraFields;
+}
+
+function buildUpdateFields(prepared) {
+  const jiraFields = {
+    summary: prepared.cleanSummary,
+
+    description: prepared.jiraDescription,
+
+    labels: prepared.labels,
+
+    assignee: prepared.assignee
+      ? {
+          name: prepared.assignee.name,
+        }
+      : null,
+  };
+
+  if (process.env.JIRA_START_DATE_FIELD) {
+    jiraFields[process.env.JIRA_START_DATE_FIELD] =
+      prepared.cleanStartDate || null;
+  }
+
+  if (process.env.JIRA_END_DATE_FIELD) {
+    jiraFields[process.env.JIRA_END_DATE_FIELD] = prepared.cleanEndDate || null;
+  }
+
+  if (normalizeText(process.env.USE_END_DATE_AS_DUE_DATE) === "true") {
+    jiraFields.duedate = prepared.cleanEndDate || null;
+  }
+
+  return jiraFields;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Health endpoint
+|--------------------------------------------------------------------------
+*/
+
+app.get("/api/health", function (req, res) {
+  return res.json({
+    success: true,
+    service: "TechOps Jira API",
+    projectKey: jiraProjectKey,
+    issueType: jiraIssueType,
+
+    dateBasedWorkflow: {
+      resolutionDateBlank: "In Progress",
+
+      resolutionDatePresent: "Done",
+    },
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Assignable users endpoint
 |--------------------------------------------------------------------------
 */
 
@@ -518,11 +1017,11 @@ app.get("/api/jira/assignees", async function (req, res) {
     const search = String(req.query.search || "").trim();
 
     const searchUrl =
-      `${process.env.JIRA_BASE_URL}` +
-      `/rest/api/2/user/assignable/search` +
-      `?project=${encodeURIComponent(process.env.JIRA_PROJECT_KEY)}` +
+      `${jiraBaseUrl}` +
+      "/rest/api/2/user/assignable/search" +
+      `?project=${encodeURIComponent(jiraProjectKey)}` +
       `&username=${encodeURIComponent(search)}` +
-      `&maxResults=100`;
+      "&maxResults=100";
 
     const response = await fetch(searchUrl, {
       method: "GET",
@@ -538,9 +1037,12 @@ app.get("/api/jira/assignees", async function (req, res) {
     if (!response.ok) {
       return res.status(response.status).json({
         success: false,
-        message: "Jira rejected the assignable-user search.",
+
+        message: "Jira rejected the " + "assignable-user search.",
+
         jiraStatus: response.status,
-        jiraErrors: jiraResult.errors || jiraResult.errorMessages || jiraResult,
+
+        jiraErrors: getJiraError(jiraResult),
       });
     }
 
@@ -552,8 +1054,11 @@ app.get("/api/jira/assignees", async function (req, res) {
           .map(function (user) {
             return {
               username: user.name || "",
+
               displayName: user.displayName || "",
+
               emailAddress: user.emailAddress || "",
+
               active: user.active === true,
             };
           })
@@ -561,7 +1066,7 @@ app.get("/api/jira/assignees", async function (req, res) {
 
     return res.json({
       success: true,
-      projectKey: process.env.JIRA_PROJECT_KEY,
+      projectKey: jiraProjectKey,
       count: users.length,
       users,
     });
@@ -570,27 +1075,13 @@ app.get("/api/jira/assignees", async function (req, res) {
 
     return res.status(500).json({
       success: false,
+
       message:
         error instanceof Error
           ? error.message
-          : "Could not retrieve Jira assignees.",
+          : "Could not retrieve " + "Jira assignees.",
     });
   }
-});
-
-/*
-|--------------------------------------------------------------------------
-| Health endpoint
-|--------------------------------------------------------------------------
-*/
-
-app.get("/api/health", function (req, res) {
-  res.json({
-    success: true,
-    service: "TechOps Jira API",
-    projectKey: process.env.JIRA_PROJECT_KEY,
-    issueType: process.env.JIRA_ISSUE_TYPE,
-  });
 });
 
 /*
@@ -601,239 +1092,57 @@ app.get("/api/health", function (req, res) {
 
 app.post("/api/jira/issues", async function (req, res) {
   try {
-    const {
-      summary,
-      description,
-      service,
-      taskSource,
-      taskDate,
-      resolution,
-      resolutionBy,
-      assignedTo,
-      startDate,
-      endDate,
-    } = req.body;
-
-    /*
-     * Validate summary.
-     */
-    if (!summary || typeof summary !== "string") {
-      return res.status(400).json({
-        success: false,
-        message: "Summary is required.",
-      });
-    }
-
-    const cleanSummary = summary.trim();
-
-    if (!cleanSummary) {
-      return res.status(400).json({
-        success: false,
-        message: "Summary cannot be empty.",
-      });
-    }
-
-    if (cleanSummary.length > 255) {
-      return res.status(400).json({
-        success: false,
-        message: "Summary cannot exceed 255 characters.",
-      });
-    }
-
-    /*
-     * Normalize Excel dates.
-     */
-    let cleanTaskDate = "";
-    let cleanStartDate = "";
-    let cleanEndDate = "";
+    let prepared;
 
     try {
-      cleanTaskDate = normalizeDate(taskDate);
-      cleanStartDate = normalizeDate(startDate);
-      cleanEndDate = normalizeDate(endDate);
-    } catch (dateError) {
+      prepared = await prepareIssueData(req.body);
+    } catch (validationError) {
       return res.status(400).json({
         success: false,
+
         message:
-          dateError instanceof Error
-            ? dateError.message
-            : "One or more dates are invalid.",
+          validationError instanceof Error
+            ? validationError.message
+            : "The request is invalid.",
       });
     }
 
     /*
-     * If Start Date was not provided separately,
-     * use Task Date as Start Date.
+     * Search Jira by Integration ID before creating.
      */
-    if (!cleanStartDate && cleanTaskDate) {
-      cleanStartDate = cleanTaskDate;
-    }
-
-    /*
-     * Determine target Jira status.
-     */
-    const calculatedStatus = cleanEndDate ? "Done" : "In Progress";
-
-    /*
-     * Validate the requested Jira assignee.
-     */
-    let assignee = null;
-
-    try {
-      assignee = await resolveAssignableUser(assignedTo);
-    } catch (assigneeError) {
-      return res.status(400).json({
-        success: false,
-        message:
-          assigneeError instanceof Error
-            ? assigneeError.message
-            : "Could not validate the requested Jira assignee.",
-      });
-    }
-
-    const normalizedRequestedAssignee = normalizeText(assignedTo);
-
-    if (
-      assignedTo &&
-      normalizedRequestedAssignee !== "unassigned" &&
-      normalizedRequestedAssignee !== "automatic" &&
-      !assignee
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          `No active assignable Jira account matched ` +
-          `"${assignedTo}" in project ` +
-          `${process.env.JIRA_PROJECT_KEY}. ` +
-          "Use the exact Jira username shown in the Assignee dropdown.",
-      });
-    }
-
-    /*
-     * Build Jira description.
-     */
-    const jiraDescription = [
-      description ? `Task Description:\n${description}` : "",
-
-      service ? `Service: ${service}` : "",
-
-      taskSource ? `Task Source: ${taskSource}` : "",
-
-      cleanTaskDate ? `Task Date: ${cleanTaskDate}` : "",
-
-      cleanStartDate ? `Start Date: ${cleanStartDate}` : "",
-
-      cleanEndDate ? `End Date: ${cleanEndDate}` : "",
-
-      `Calculated Jira Status: ${calculatedStatus}`,
-
-      resolution ? `Resolution:\n${resolution}` : "",
-
-      resolutionBy ? `Resolution By: ${resolutionBy}` : "",
-
-      assignee
-        ? `Requested Assignee: ` +
-          `${assignee.displayName || assignee.name} ` +
-          `(${assignee.name})`
-        : "Requested Assignee: Unassigned",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    /*
-     * Build labels.
-     */
-    const labels = ["excel-techops"];
-
-    const serviceLabel = createServiceLabel(service);
-
-    if (serviceLabel) {
-      labels.push(serviceLabel);
-    }
-
-    if (cleanEndDate) {
-      labels.push("excel-completed");
-    } else {
-      labels.push("excel-in-progress");
-    }
-
-    /*
-     * Build Jira fields.
-     */
-    const jiraFields = {
-      project: {
-        key: process.env.JIRA_PROJECT_KEY,
-      },
-
-      issuetype: {
-        name: process.env.JIRA_ISSUE_TYPE,
-      },
-
-      summary: cleanSummary,
-
-      description: jiraDescription,
-
-      priority: {
-        name: "Medium",
-      },
-
-      labels,
-    };
-
-    /*
-     * Add the verified assignee.
-     */
-    if (assignee) {
-      jiraFields.assignee = {
-        name: assignee.name,
-      };
-    }
-
-    /*
-     * Optional Jira custom Start Date field.
-     */
-    if (cleanStartDate && process.env.JIRA_START_DATE_FIELD) {
-      jiraFields[process.env.JIRA_START_DATE_FIELD] = cleanStartDate;
-    }
-
-    /*
-     * Optional Jira custom End Date field.
-     */
-    if (cleanEndDate && process.env.JIRA_END_DATE_FIELD) {
-      jiraFields[process.env.JIRA_END_DATE_FIELD] = cleanEndDate;
-    }
-
-    /*
-     * Optionally use End Date as Jira Due Date.
-     */
-    if (
-      cleanEndDate &&
-      normalizeText(process.env.USE_END_DATE_AS_DUE_DATE) === "true"
-    ) {
-      jiraFields.duedate = cleanEndDate;
-    }
-
-    const jiraPayload = {
-      fields: jiraFields,
-    };
-
-    /*
-     * Create Jira issue.
-     */
-    const jiraResponse = await fetch(
-      `${process.env.JIRA_BASE_URL}/rest/api/2/issue`,
-      {
-        method: "POST",
-
-        headers: {
-          Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
-          Accept: "application/json",
-          "Content-Type": "application/json",
-        },
-
-        body: JSON.stringify(jiraPayload),
-      },
+    const existingIssue = await findIssueByIntegrationId(
+      prepared.cleanIntegrationId,
     );
+
+    if (existingIssue) {
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+
+        jiraKey: existingIssue.key,
+
+        jiraUrl: `${jiraBaseUrl}/browse/` + `${existingIssue.key}`,
+
+        message:
+          "This Excel row is already " + `connected to ${existingIssue.key}.`,
+      });
+    }
+
+    const jiraFields = buildCreateFields(prepared);
+
+    const jiraResponse = await fetch(`${jiraBaseUrl}/rest/api/2/issue`, {
+      method: "POST",
+
+      headers: {
+        Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+
+      body: JSON.stringify({
+        fields: jiraFields,
+      }),
+    });
 
     const jiraResult = await parseResponse(jiraResponse);
 
@@ -845,73 +1154,77 @@ app.post("/api/jira/issues", async function (req, res) {
 
       return res.status(jiraResponse.status).json({
         success: false,
-        message: "Jira rejected the issue creation request.",
+
+        message: "Jira rejected the " + "issue creation request.",
+
         jiraStatus: jiraResponse.status,
-        jiraErrors: jiraResult.errors || jiraResult.errorMessages || jiraResult,
+
+        jiraErrors: getJiraError(jiraResult),
       });
     }
 
     const createdIssueKey = jiraResult.key;
 
-    /*
-     * Move the issue according to End Date:
-     *
-     * End Date blank   -> In Progress
-     * End Date present -> Done
-     */
     let statusResult;
 
     try {
-      statusResult = await applyDateBasedStatus(createdIssueKey, cleanEndDate);
+      statusResult = await applyDateBasedStatus(
+        createdIssueKey,
+        prepared.cleanEndDate,
+      );
     } catch (statusError) {
       console.error("Issue created, but status update failed", {
         issueKey: createdIssueKey,
-        calculatedStatus,
+
+        calculatedStatus: prepared.calculatedStatus,
+
         error: statusError instanceof Error ? statusError.message : statusError,
       });
 
       statusResult = {
-        requestedStatus: calculatedStatus,
+        requestedStatus: prepared.calculatedStatus,
+
         statusChanged: false,
+
         actualResult: {
           success: false,
           changed: false,
         },
+
         message:
           statusError instanceof Error
             ? statusError.message
-            : "The Jira issue was created, but the " +
-              "workflow status could not be updated.",
+            : "The issue was created, " +
+              "but the workflow status " +
+              "could not be updated.",
       };
     }
 
-    /*
-     * Return Jira issue details to Excel.
-     *
-     * A failed transition does not delete the created issue.
-     * The response shows statusChanged=false.
-     */
     return res.status(201).json({
       success: true,
 
       jiraKey: createdIssueKey,
 
-      jiraUrl: `${process.env.JIRA_BASE_URL}` + `/browse/${createdIssueKey}`,
+      jiraUrl: `${jiraBaseUrl}/browse/` + `${createdIssueKey}`,
 
-      assignee: assignee
+      integrationId: prepared.cleanIntegrationId,
+
+      assignee: prepared.assignee
         ? {
-            username: assignee.name,
-            displayName: assignee.displayName || assignee.name,
+            username: prepared.assignee.name,
+
+            displayName:
+              prepared.assignee.displayName || prepared.assignee.name,
           }
         : null,
 
-      taskDate: cleanTaskDate,
+      taskDate: prepared.cleanTaskDate,
 
-      startDate: cleanStartDate,
+      startDate: prepared.cleanStartDate,
 
-      endDate: cleanEndDate,
+      endDate: prepared.cleanEndDate,
 
-      calculatedStatus,
+      calculatedStatus: prepared.calculatedStatus,
 
       statusChanged: Boolean(statusResult.statusChanged),
 
@@ -921,21 +1234,219 @@ app.post("/api/jira/issues", async function (req, res) {
       statusDetails: statusResult,
 
       message: statusResult.statusChanged
-        ? `Jira issue ${createdIssueKey} was created ` +
-          `and moved to ${calculatedStatus}.`
-        : `Jira issue ${createdIssueKey} was created, ` +
-          `but it could not be moved to ` +
-          `${calculatedStatus}.`,
+        ? `Jira issue ${createdIssueKey} ` +
+          "was created and moved to " +
+          `${prepared.calculatedStatus}.`
+        : `Jira issue ${createdIssueKey} ` +
+          "was created, but could not " +
+          "be moved to " +
+          `${prepared.calculatedStatus}.`,
     });
   } catch (error) {
-    console.error("Unexpected Jira integration error", error);
+    console.error("Unexpected Jira creation error", error);
 
     return res.status(500).json({
       success: false,
+
       message:
         error instanceof Error
           ? error.message
-          : "The Jira integration encountered " + "an internal error.",
+          : "The Jira integration " + "encountered an error.",
+    });
+  }
+});
+
+/*
+|--------------------------------------------------------------------------
+| Update existing Jira issue
+|--------------------------------------------------------------------------
+*/
+
+app.put("/api/jira/issues/:jiraKey", async function (req, res) {
+  try {
+    const jiraKey = String(req.params.jiraKey || "")
+      .trim()
+      .toUpperCase();
+
+    if (!validateJiraKey(jiraKey)) {
+      return res.status(400).json({
+        success: false,
+
+        message: `A valid ${jiraProjectKey} ` + "Jira Key is required.",
+      });
+    }
+
+    const existingIssue = await getJiraIssue(jiraKey);
+
+    if (!existingIssue) {
+      return res.status(404).json({
+        success: false,
+
+        message: `Jira issue ${jiraKey} was not found.`,
+      });
+    }
+
+    let prepared;
+
+    try {
+      prepared = await prepareIssueData(req.body);
+    } catch (validationError) {
+      return res.status(400).json({
+        success: false,
+
+        message:
+          validationError instanceof Error
+            ? validationError.message
+            : "The request is invalid.",
+      });
+    }
+
+    /*
+     * Ensure this Integration ID does not belong to a
+     * different Jira issue.
+     */
+    const issueUsingIntegrationId = await findIssueByIntegrationId(
+      prepared.cleanIntegrationId,
+    );
+
+    if (issueUsingIntegrationId && issueUsingIntegrationId.key !== jiraKey) {
+      return res.status(409).json({
+        success: false,
+        duplicate: true,
+
+        jiraKey: issueUsingIntegrationId.key,
+
+        jiraUrl: `${jiraBaseUrl}/browse/` + `${issueUsingIntegrationId.key}`,
+
+        message:
+          "This Integration ID belongs to " +
+          `${issueUsingIntegrationId.key}, ` +
+          `not ${jiraKey}.`,
+      });
+    }
+
+    const jiraFields = buildUpdateFields(prepared);
+
+    const updateResponse = await fetch(
+      `${jiraBaseUrl}/rest/api/2/issue/` + `${encodeURIComponent(jiraKey)}`,
+      {
+        method: "PUT",
+
+        headers: {
+          Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+
+        body: JSON.stringify({
+          fields: jiraFields,
+        }),
+      },
+    );
+
+    const updateResult = await parseResponse(updateResponse);
+
+    if (!updateResponse.ok) {
+      console.error("Jira issue update failed", {
+        jiraKey,
+        status: updateResponse.status,
+        response: updateResult,
+      });
+
+      return res.status(updateResponse.status).json({
+        success: false,
+
+        message: `Jira rejected the update ` + `for ${jiraKey}.`,
+
+        jiraStatus: updateResponse.status,
+
+        jiraErrors: getJiraError(updateResult),
+      });
+    }
+
+    let statusResult;
+
+    try {
+      statusResult = await applyDateBasedStatus(jiraKey, prepared.cleanEndDate);
+    } catch (statusError) {
+      console.error("Issue updated, but status change failed", {
+        jiraKey,
+
+        calculatedStatus: prepared.calculatedStatus,
+
+        error: statusError instanceof Error ? statusError.message : statusError,
+      });
+
+      statusResult = {
+        requestedStatus: prepared.calculatedStatus,
+
+        statusChanged: false,
+
+        actualResult: {
+          success: false,
+          changed: false,
+        },
+
+        message:
+          statusError instanceof Error
+            ? statusError.message
+            : "The issue was updated, but " +
+              "the workflow status could " +
+              "not be changed.",
+      };
+    }
+
+    return res.json({
+      success: true,
+
+      jiraKey,
+
+      jiraUrl: `${jiraBaseUrl}/browse/${jiraKey}`,
+
+      integrationId: prepared.cleanIntegrationId,
+
+      assignee: prepared.assignee
+        ? {
+            username: prepared.assignee.name,
+
+            displayName:
+              prepared.assignee.displayName || prepared.assignee.name,
+          }
+        : null,
+
+      taskDate: prepared.cleanTaskDate,
+
+      startDate: prepared.cleanStartDate,
+
+      endDate: prepared.cleanEndDate,
+
+      calculatedStatus: prepared.calculatedStatus,
+
+      statusChanged: Boolean(statusResult.statusChanged),
+
+      statusMessage: statusResult.message || "",
+
+      statusDetails: statusResult,
+
+      message: statusResult.statusChanged
+        ? `Jira issue ${jiraKey} was ` +
+          "updated and synchronized to " +
+          `${prepared.calculatedStatus}.`
+        : `Jira issue ${jiraKey} was ` +
+          "updated, but the workflow " +
+          "status could not be moved to " +
+          `${prepared.calculatedStatus}.`,
+    });
+  } catch (error) {
+    console.error("Unexpected Jira update error", error);
+
+    return res.status(500).json({
+      success: false,
+
+      message:
+        error instanceof Error
+          ? error.message
+          : "The Jira update encountered " + "an internal error.",
     });
   }
 });
@@ -973,11 +1484,17 @@ const port = Number(process.env.PORT || 3000);
 app.listen(port, function () {
   console.log(`TechOps Jira API listening on port ${port}`);
 
-  console.log(`Jira project: ${process.env.JIRA_PROJECT_KEY}`);
+  console.log(`Jira project: ${jiraProjectKey}`);
 
-  console.log(`Jira issue type: ${process.env.JIRA_ISSUE_TYPE}`);
+  console.log(`Jira issue type: ${jiraIssueType}`);
 
-  console.log("Date-based workflow: End Date blank = In Progress");
+  console.log("Resolution Date blank: In Progress");
 
-  console.log("Date-based workflow: End Date present = Done");
+  console.log("Resolution Date populated: Done");
+
+  console.log(
+    process.env.EXPRESS_INTEGRATION_KEY
+      ? "Express integration-key protection: Enabled"
+      : "Express integration-key protection: Disabled",
+  );
 });
