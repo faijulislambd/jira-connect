@@ -59,21 +59,38 @@ app.use(
   }),
 );
 
+const allowedOriginPatterns = [
+  /^https:\/\/[^.]+\.officescripts\.microsoftusercontent\.com$/i,
+  /^https:\/\/[^.]+\.officeapps\.live\.com$/i,
+  /^https:\/\/excel\.officeapps\.live\.com$/i,
+  /^https:\/\/www\.office\.com$/i,
+  /^https:\/\/www\.microsoft365\.com$/i,
+];
+
 app.use(
   cors({
     origin: function (origin, callback) {
       /*
-       * PowerShell and server-side tools may not include an Origin.
-       * Office Scripts normally uses a Microsoft-hosted origin.
+       * Allow server-side requests that do not include Origin.
        */
-      if (
-        !origin ||
-        /^https:\/\/[^.]+\.officescripts\.microsoftusercontent\.com$/.test(
-          origin,
-        )
-      ) {
+      if (!origin) {
         return callback(null, true);
       }
+
+      let isAllowedOrigin = false;
+
+      for (let index = 0; index < allowedOriginPatterns.length; index++) {
+        if (allowedOriginPatterns[index].test(origin)) {
+          isAllowedOrigin = true;
+          break;
+        }
+      }
+
+      if (isAllowedOrigin) {
+        return callback(null, true);
+      }
+
+      console.warn(`Blocked CORS origin: ${origin}`);
 
       return callback(new Error("Origin is not permitted."));
     },
@@ -81,9 +98,16 @@ app.use(
     methods: ["GET", "POST", "PUT", "OPTIONS"],
 
     allowedHeaders: ["Content-Type", "Accept", "X-Integration-Key"],
+
+    exposedHeaders: ["Content-Type"],
+
+    credentials: false,
+
+    optionsSuccessStatus: 204,
+
+    maxAge: 86400,
   }),
 );
-
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
