@@ -90,9 +90,16 @@ app.use(
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
-    max: 30,
+    max: 2000,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: function (req) {
+      return (
+        req.method === "OPTIONS" ||
+        req.path === "/api/ping" ||
+        req.path === "/api/health"
+      );
+    },
   }),
 );
 
