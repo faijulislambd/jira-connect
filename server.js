@@ -49,55 +49,44 @@ const jiraIssueType = String(process.env.JIRA_ISSUE_TYPE).trim();
 |--------------------------------------------------------------------------
 */
 
-const allowedOriginPatterns = [
-  /^https:\/\/[^.]+\.officescripts\.microsoftusercontent\.com$/i,
-  /^https:\/\/[^.]+\.officeapps\.live\.com$/i,
-  /^https:\/\/excel\.officeapps\.live\.com$/i,
-  /^https:\/\/www\.office\.com$/i,
-  /^https:\/\/www\.microsoft365\.com$/i,
-];
+app.disable("x-powered-by");
 
 app.use(
-  cors({
-    origin: function (origin, callback) {
-      /*
-       * Allow server-side requests that do not include Origin.
-       */
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      let isAllowedOrigin = false;
-
-      for (let index = 0; index < allowedOriginPatterns.length; index++) {
-        if (allowedOriginPatterns[index].test(origin)) {
-          isAllowedOrigin = true;
-          break;
-        }
-      }
-
-      if (isAllowedOrigin) {
-        return callback(null, true);
-      }
-
-      console.warn(`Blocked CORS origin: ${origin}`);
-
-      return callback(new Error("Origin is not permitted."));
-    },
-
-    methods: ["GET", "POST", "PUT", "OPTIONS"],
-
-    allowedHeaders: ["Content-Type", "Accept", "X-Integration-Key"],
-
-    exposedHeaders: ["Content-Type"],
-
-    credentials: false,
-
-    optionsSuccessStatus: 204,
-
-    maxAge: 86400,
+  helmet({
+    crossOriginResourcePolicy: false,
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: false,
   }),
 );
+
+/*
+ * Office Scripts runs in a browser-hosted environment. This API does not use
+ * browser cookies, so wildcard CORS is safe for transport diagnostics. Protect
+ * /api/jira with EXPRESS_INTEGRATION_KEY if the API is publicly exposed.
+ */
+app.use(function (req, res, next) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Accept, X-Integration-Key",
+  );
+  res.setHeader("Access-Control-Max-Age", "86400");
+  res.setHeader("Vary", "Origin, Access-Control-Request-Headers");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  return next();
+});
+
+app.use(
+  express.json({
+    limit: "100kb",
+  }),
+);
+
 app.use(
   rateLimit({
     windowMs: 60 * 1000,
@@ -382,23 +371,38 @@ async function loadJiraTokenEntries(forceRefresh = false) {
 }
 
 async function resolveJiraTokenForAssignee(assignedTo) {
-  if (!isUnassignedValue(assignedTo)) {
-    const requested = normalizeText(assignedTo);
-    const entries = await loadJiraTokenEntries();
-    const match = entries.find(function (entry) {
-      return normalizeText(entry.name) === requested;
-    });
-    if (match)
-      return {
-        token: match.token,
-        source: "upstash-assignee-token",
-        user: match.name,
-      };
+  const requestedName = String(assignedTo || "").trim();
+
+  if (!requestedName || isUnassignedValue(requestedName)) {
+    throw new Error(
+      "Assigned To is required because the Jira token is selected from Upstash.",
+    );
   }
+
+  const entries = await loadJiraTokenEntries();
+  const normalizedRequestedName = normalizeText(requestedName);
+
+  const match = entries.find(function (entry) {
+    return normalizeText(entry.name) === normalizedRequestedName;
+  });
+
+  if (!match) {
+    const availableNames = entries
+      .map(function (entry) {
+        return entry.name;
+      })
+      .join(", ");
+
+    throw new Error(
+      `No Upstash Jira token matched Assigned To "${requestedName}". ` +
+        `Available names: ${availableNames || "none"}.`,
+    );
+  }
+
   return {
-    token: String(process.env.JIRA_TOKEN).trim(),
-    source: "environment-default",
-    user: "",
+    token: match.token,
+    source: "upstash-assignee-token",
+    user: match.name,
   };
 }
 
@@ -1132,6 +1136,16 @@ function buildUpdateFields(prepared) {
 |--------------------------------------------------------------------------
 */
 
+app.get("/api/ping", function (req, res) {
+  return res.status(200).json({
+    success: true,
+    message: "Jira connector is reachable.",
+    timestamp: new Date().toISOString(),
+    requestOrigin: req.get("origin") || null,
+    userAgent: req.get("user-agent") || null,
+  });
+});
+
 app.get("/api/health", async function (req, res) {
   try {
     const tokenEntries = await loadJiraTokenEntries();
@@ -1147,9 +1161,8 @@ app.get("/api/health", async function (req, res) {
           return entry.name;
         }),
         count: tokenEntries.length,
-        fallbackConfigured: Boolean(
-          String(process.env.JIRA_TOKEN || "").trim(),
-        ),
+        fallbackConfigured: false,
+        fallbackEnabled: false,
       },
       dateBasedWorkflow: {
         resolutionDateBlank: "In Progress",
@@ -1167,9 +1180,8 @@ app.get("/api/health", async function (req, res) {
         key: jiraTokenStoreKey,
         availableTokenNames: [],
         count: 0,
-        fallbackConfigured: Boolean(
-          String(process.env.JIRA_TOKEN || "").trim(),
-        ),
+        fallbackConfigured: false,
+        fallbackEnabled: false,
         error:
           error instanceof Error ? error.message : "Token store unavailable.",
       },
@@ -1190,19 +1202,19 @@ app.get("/api/health", async function (req, res) {
 app.get("/api/jira/assignees", async function (req, res) {
   try {
     const search = String(req.query.search || "").trim();
+    const assignedTo = String(req.query.assignedTo || search).trim();
+    const jiraCredential = await resolveJiraTokenForAssignee(assignedTo);
 
     const searchUrl =
-      `${jiraBaseUrl}` +
-      "/rest/api/2/user/assignable/search" +
+      `${jiraBaseUrl}/rest/api/2/user/assignable/search` +
       `?project=${encodeURIComponent(jiraProjectKey)}` +
       `&username=${encodeURIComponent(search)}` +
       "&maxResults=100";
 
     const response = await fetch(searchUrl, {
       method: "GET",
-
       headers: {
-        Authorization: `Bearer ${process.env.JIRA_TOKEN}`,
+        Authorization: `Bearer ${jiraCredential.token}`,
         Accept: "application/json",
       },
     });
@@ -1212,11 +1224,8 @@ app.get("/api/jira/assignees", async function (req, res) {
     if (!response.ok) {
       return res.status(response.status).json({
         success: false,
-
-        message: "Jira rejected the " + "assignable-user search.",
-
+        message: "Jira rejected the assignable-user search.",
         jiraStatus: response.status,
-
         jiraErrors: getJiraError(jiraResult),
       });
     }
@@ -1229,11 +1238,8 @@ app.get("/api/jira/assignees", async function (req, res) {
           .map(function (user) {
             return {
               username: user.name || "",
-
               displayName: user.displayName || "",
-
               emailAddress: user.emailAddress || "",
-
               active: user.active === true,
             };
           })
@@ -1242,19 +1248,18 @@ app.get("/api/jira/assignees", async function (req, res) {
     return res.json({
       success: true,
       projectKey: jiraProjectKey,
+      tokenUser: jiraCredential.user,
       count: users.length,
       users,
     });
   } catch (error) {
     console.error("Assignable-user endpoint failed", error);
-
     return res.status(500).json({
       success: false,
-
       message:
         error instanceof Error
           ? error.message
-          : "Could not retrieve " + "Jira assignees.",
+          : "Could not retrieve Jira assignees.",
     });
   }
 });
@@ -1664,21 +1669,20 @@ app.use(function (error, req, res, next) {
 
 const port = Number(process.env.PORT || 3000);
 
-app.listen(port, function () {
-  console.log(`TechOps Jira API listening on port ${port}`);
+if (!process.env.VERCEL) {
+  app.listen(port, function () {
+    console.log(`TechOps Jira API listening on port ${port}`);
+    console.log(`Jira project: ${jiraProjectKey}`);
+    console.log(`Jira issue type: ${jiraIssueType}`);
+    console.log("Resolution Date blank: In Progress");
+    console.log("Resolution Date populated: Done");
+    console.log(`Jira token store: Upstash key ${jiraTokenStoreKey}`);
+    console.log(
+      process.env.EXPRESS_INTEGRATION_KEY
+        ? "Express integration-key protection: Enabled"
+        : "Express integration-key protection: Disabled",
+    );
+  });
+}
 
-  console.log(`Jira project: ${jiraProjectKey}`);
-
-  console.log(`Jira issue type: ${jiraIssueType}`);
-
-  console.log("Resolution Date blank: In Progress");
-
-  console.log("Resolution Date populated: Done");
-  console.log(`Jira token store: Upstash key ${jiraTokenStoreKey}`);
-
-  console.log(
-    process.env.EXPRESS_INTEGRATION_KEY
-      ? "Express integration-key protection: Enabled"
-      : "Express integration-key protection: Disabled",
-  );
-});
+module.exports = app;
