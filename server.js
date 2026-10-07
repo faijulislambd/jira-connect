@@ -49,16 +49,6 @@ const jiraIssueType = String(process.env.JIRA_ISSUE_TYPE).trim();
 |--------------------------------------------------------------------------
 */
 
-app.disable("x-powered-by");
-
-app.use(helmet());
-
-app.use(
-  express.json({
-    limit: "100kb",
-  }),
-);
-
 const allowedOriginPatterns = [
   /^https:\/\/[^.]+\.officescripts\.microsoftusercontent\.com$/i,
   /^https:\/\/[^.]+\.officeapps\.live\.com$/i,
